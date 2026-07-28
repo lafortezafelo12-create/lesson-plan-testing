@@ -1,0 +1,13 @@
+{
+  "name": "ilaw-dll-generator",
+  "version": "1.0.0",
+  "description": "AI-assisted Daily Lesson Log generator (ILAW Format) - Netlify + Gemini API",
+  "private": true,
+  "scripts": {
+    "dev": "netlify dev"
+  },
+  "dependencies": {
+    "@netlify/blobs": "^10.7.9",
+    "docx": "^9.7.1"
+  }
+}
