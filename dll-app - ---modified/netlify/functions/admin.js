@@ -1,14 +1,32 @@
 // netlify/functions/admin.js
-// Lets an admin update the Gemini API key without redeploying the site.
+// Lets an admin update the Gemini API key(s) without redeploying the site.
 // The password check happens here, server-side, against the ADMIN_PASSWORD
 // environment variable — it is never present in any frontend file, so it's
 // safe even though this repo may be public on GitHub.
 //
-// The key itself is stored in Netlify Blobs (not in a file, not in git),
-// and generate.js checks this store first before falling back to the
-// GEMINI_API_KEY environment variable.
+// The key(s) are stored in Netlify Blobs (not in a file, not in git), as a
+// single comma-separated string, and generate.js checks this store first
+// before falling back to the GEMINI_API_KEY environment variable. Multiple
+// keys enable automatic failover in generate.js if one key is invalid,
+// rate-limited, or out of quota.
 
 const { connectLambda, getStore } = require("@netlify/blobs");
+
+// Parses a comma-separated string of keys into a clean array (trims
+// whitespace, drops empty entries, de-dupes while preserving order).
+function parseKeyList(raw) {
+  if (!raw) return [];
+  const seen = new Set();
+  const out = [];
+  raw.split(",").forEach((k) => {
+    const key = k.trim();
+    if (key && !seen.has(key)) {
+      seen.add(key);
+      out.push(key);
+    }
+  });
+  return out;
+}
 
 exports.handler = async (event) => {
   if (event.httpMethod !== "POST") {
@@ -43,20 +61,22 @@ exports.handler = async (event) => {
   const store = getStore({ name: "ilaw-settings" });
 
   if (action === "status") {
-    let hasOverride = false;
-    let preview = null;
+    let keys = [];
     try {
       const current = await store.get("gemini_api_key");
-      if (current && current.trim()) {
-        hasOverride = true;
-        preview = `••••${current.trim().slice(-4)}`;
-      }
+      keys = parseKeyList(current);
     } catch {
       /* no override set */
     }
+    const hasOverride = keys.length > 0;
     return {
       statusCode: 200,
-      body: JSON.stringify({ hasOverride, preview, usingEnvFallback: !hasOverride }),
+      body: JSON.stringify({
+        hasOverride,
+        keyCount: keys.length,
+        previews: keys.map((k) => `••••${k.slice(-4)}`),
+        usingEnvFallback: !hasOverride,
+      }),
     };
   }
 
@@ -66,11 +86,19 @@ exports.handler = async (event) => {
   }
 
   if (action === "set") {
-    if (!apiKey || apiKey.trim().length < 10) {
-      return { statusCode: 400, body: JSON.stringify({ error: "That doesn't look like a valid API key." }) };
+    const keys = parseKeyList(apiKey);
+    if (!keys.length) {
+      return { statusCode: 400, body: JSON.stringify({ error: "Enter at least one API key." }) };
     }
-    await store.set("gemini_api_key", apiKey.trim());
-    return { statusCode: 200, body: JSON.stringify({ success: true }) };
+    const tooShort = keys.find((k) => k.length < 10);
+    if (tooShort) {
+      return {
+        statusCode: 400,
+        body: JSON.stringify({ error: `"${tooShort.slice(0, 6)}…" doesn't look like a valid API key.` }),
+      };
+    }
+    await store.set("gemini_api_key", keys.join(","));
+    return { statusCode: 200, body: JSON.stringify({ success: true, keyCount: keys.length }) };
   }
 
   return { statusCode: 400, body: JSON.stringify({ error: "Unknown action. Use 'status', 'set', or 'clear'." }) };

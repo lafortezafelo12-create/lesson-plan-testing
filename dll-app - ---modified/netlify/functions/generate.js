@@ -10,10 +10,20 @@
 // map is the only place that needs to change.
 const { connectLambda, getStore } = require("@netlify/blobs");
 
+// Each entry maps the frontend's short model key to the real Gemini model ID,
+// plus an optional thinkingLevel override. Gemini 3.x models default to
+// "high" thinking when unspecified (Flash-Lite is the one exception, which
+// defaults to "minimal") — "high" can add significant latency on complex,
+// heavily-structured prompts like a Detailed multi-day lesson, enough to
+// exceed Netlify's fixed 60-second function timeout. Flash is pinned to
+// "low" to keep it fast and reliable for its "recommended" everyday role;
+// Pro is deliberately left at its default (slower, deeper reasoning) since
+// that's the whole point of offering it as the "higher quality, slower"
+// option.
 const MODEL_MAP = {
-  flash: "gemini-3.5-flash",
-  pro: "gemini-3.1-pro-preview",
-  "flash-lite": "gemini-3.1-flash-lite",
+  flash: { id: "gemini-3.5-flash", thinkingLevel: "low" },
+  pro: { id: "gemini-3.1-pro-preview" },
+  "flash-lite": { id: "gemini-3.1-flash-lite" },
 };
 const DEFAULT_MODEL_KEY = "flash";
 
@@ -195,16 +205,73 @@ function buildAssessmentInstructions(assessmentTypes, mcItemCount, otherAssessme
   return lines.join("\n");
 }
 
-async function resolveApiKey(event) {
+// Parses a comma-separated string of keys into a clean array (trims
+// whitespace, drops empty entries, de-dupes while preserving order).
+function parseKeyList(raw) {
+  if (!raw) return [];
+  const seen = new Set();
+  const out = [];
+  raw.split(",").forEach((k) => {
+    const key = k.trim();
+    if (key && !seen.has(key)) {
+      seen.add(key);
+      out.push(key);
+    }
+  });
+  return out;
+}
+
+// Returns an ordered array of Gemini API keys to try. The admin override (if
+// set) takes priority and completely replaces the env var list — same
+// mutual-exclusivity as before, just each side can now hold multiple
+// comma-separated keys instead of exactly one.
+async function resolveApiKeys(event) {
   try {
     connectLambda(event);
     const store = getStore({ name: "ilaw-settings" });
     const override = await store.get("gemini_api_key");
-    if (override && override.trim()) return override.trim();
+    const overrideKeys = parseKeyList(override);
+    if (overrideKeys.length) return overrideKeys;
   } catch {
     // Blobs not available (e.g. very old local setup) — fall back silently.
   }
-  return process.env.GEMINI_API_KEY || null;
+  return parseKeyList(process.env.GEMINI_API_KEY);
+}
+
+// HTTP statuses that mean "this specific key is the problem" (invalid key,
+// no permission, rate-limited/out of quota) — worth retrying with the next
+// key. Any other status (e.g. a malformed request, or a genuine Gemini-side
+// 500) will fail identically no matter which key is used, so there's no
+// point burning the rest of Netlify's 60-second budget cycling through keys
+// for those — fail fast instead.
+const KEY_ROTATION_STATUSES = new Set([400, 401, 403, 429]);
+
+async function callGeminiWithFailover(modelUrlBase, body, apiKeys) {
+  let lastFailure = null;
+  for (let i = 0; i < apiKeys.length; i++) {
+    let resp;
+    try {
+      resp = await fetch(`${modelUrlBase}?key=${apiKeys[i]}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+    } catch (networkErr) {
+      lastFailure = { status: null, errText: String(networkErr), attempts: i + 1 };
+      continue; // network hiccup — still worth trying the next key
+    }
+    if (resp.ok) {
+      return { ok: true, resp, attempts: i + 1 };
+    }
+    const errText = await resp.text();
+    lastFailure = { status: resp.status, errText, attempts: i + 1 };
+    if (!KEY_ROTATION_STATUSES.has(resp.status)) {
+      return { ok: false, ...lastFailure };
+    }
+    // else: this key looks like the problem (invalid/rate-limited) — loop
+    // continues and tries the next key, if any remain.
+  }
+  return { ok: false, ...lastFailure };
 }
 
 exports.handler = async (event) => {
@@ -212,13 +279,13 @@ exports.handler = async (event) => {
     return { statusCode: 405, body: "Method Not Allowed" };
   }
 
-  const apiKey = await resolveApiKey(event);
-  if (!apiKey) {
+  const apiKeys = await resolveApiKeys(event);
+  if (!apiKeys.length) {
     return {
       statusCode: 500,
       body: JSON.stringify({
         error:
-          "No Gemini API key is configured. Set GEMINI_API_KEY in Netlify, or add one via the Admin panel.",
+          "No Gemini API key is configured. Set GEMINI_API_KEY in Netlify (comma-separate multiple keys for automatic failover), or add one via the Admin panel.",
       }),
     };
   }
@@ -243,7 +310,8 @@ exports.handler = async (event) => {
   }
 
   const modelKey = MODEL_MAP[model] ? model : DEFAULT_MODEL_KEY;
-  const MODEL = MODEL_MAP[modelKey];
+  const modelConfig = MODEL_MAP[modelKey];
+  const MODEL = modelConfig.id;
   const days = Math.max(1, Math.min(10, parseInt(numDays, 10) || 1));
   const mcCount = Math.max(1, Math.min(20, parseInt(mcItemCount, 10) || 5));
 
@@ -445,30 +513,40 @@ OUTPUT LANGUAGE (decided already — do not re-derive or override this):
 ${schemaHint}`;
 
   try {
-    const resp = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${apiKey}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          contents: [{ role: "user", parts: [{ text: prompt }] }],
-          generationConfig: {
-            responseMimeType: "application/json",
-            temperature: 0.6,
-          },
-        }),
-      }
+    const generationConfig = {
+      responseMimeType: "application/json",
+      // No "temperature" override: Gemini 3.x models are tuned for their
+      // default of 1.0, and Google's own docs warn that lowering it can
+      // cause looping or degraded performance on complex, highly-structured
+      // tasks like this one.
+    };
+    if (modelConfig.thinkingLevel) {
+      generationConfig.thinkingConfig = { thinkingLevel: modelConfig.thinkingLevel };
+    }
+
+    const modelUrlBase = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent`;
+    const result = await callGeminiWithFailover(
+      modelUrlBase,
+      { contents: [{ role: "user", parts: [{ text: prompt }] }], generationConfig },
+      apiKeys
     );
 
-    if (!resp.ok) {
-      const errText = await resp.text();
+    if (!result.ok) {
+      const keyNote =
+        apiKeys.length > 1
+          ? ` (tried ${result.attempts} of ${apiKeys.length} configured keys)`
+          : "";
       return {
         statusCode: 502,
-        body: JSON.stringify({ error: "Gemini API error", details: errText, model: MODEL }),
+        body: JSON.stringify({
+          error: `Gemini API error${keyNote}`,
+          details: result.errText,
+          model: MODEL,
+        }),
       };
     }
 
-    const data = await resp.json();
+    const data = await result.resp.json();
     const text = data?.candidates?.[0]?.content?.parts?.map((p) => p.text || "").join("") || "";
 
     let parsed;
