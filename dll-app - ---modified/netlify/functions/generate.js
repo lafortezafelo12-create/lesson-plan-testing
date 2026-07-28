@@ -212,39 +212,36 @@ exports.handler = async (event) => {
   const assessmentInstructions = buildAssessmentInstructions(assessmentTypes, mcCount, otherAssessment);
   const isDetailed = activityDetail === "detailed";
 
-  // The full menu of teaching strategies Detailed mode can draw on. Not every
-  // strategy belongs in every phase or every day — the model is told to pick
-  // whichever ones genuinely fit each phase of the chosen design pattern,
-  // rather than forcing all of them into one lesson.
+  // The full menu of teaching strategies Detailed mode can draw on for the FLOW
+  // (During-Lesson) phases. Drill and Review live only in the Pre-Lesson field
+  // now, so they're deliberately excluded here to avoid repeating them. Not
+  // every strategy belongs in every phase — the model picks whichever ones
+  // genuinely fit each phase of the chosen design pattern.
   const STRATEGY_MENU = [
-    "Drill", "Review of Previous Lesson", "Motivation/Engagement Activity",
-    "Icebreaker or Energizer", "Activating Prior Knowledge", "Think-Pair-Share",
-    "Questioning Techniques", "Demonstration", "Guided Practice",
-    "Collaborative Learning", "Hands-on Investigation", "Independent Practice",
-    "Reflection", "Exit Ticket", "Formative Assessment", "Differentiated Activities",
+    "Motivation/Engagement Activity", "Icebreaker or Energizer",
+    "Activating Prior Knowledge", "Think-Pair-Share", "Questioning Techniques",
+    "Demonstration", "Guided Practice", "Collaborative Learning",
+    "Hands-on Investigation", "Independent Practice", "Reflection",
+    "Exit Ticket", "Formative Assessment", "Differentiated Activities",
   ].join(", ");
 
   const preLessonFormatBlock = isDetailed
     ? `
-PRE-LESSON FORMAT — structure every day's "preLesson" as this exact sequence of bold heading lines,
-each followed by 1 bullet line ("- ...") that names a concrete teacher action AND the expected learner
-response/behavior, so it reads as a short classroom script rather than a label:
-1. **Classroom Routine:** (e.g. seating, prayer, greeting — a specific, brief opener)
-2. **Attendance:** (how it's taken quickly without eating into instructional time)
-3. **Drill:** (a fast, specific skill warm-up tied to a prerequisite skill for today's lesson)
-4. **Review of Previous Lesson:** (a specific question or task that surfaces what learners recall from
-   the prior session, with the expected learner answer)
-5. **Motivation/Engagement Activity:** (a short hook — a real object, a Philippine-setting scenario, a
-   quick game, or a provocative question — specific enough to visualize)
-6. **Lesson Objective:** (how the teacher states today's objective in learner-friendly words the class
-   can repeat back)
-7. **Activating Prior Knowledge:** (a specific question or quick task that bridges what learners
-   already know to today's new concept, with the expected learner response)
-End with one bullet line that is the exact transition statement the teacher says to move the class
-into the first phase of the lesson proper (e.g. "- Transition: \\"Ngayon, tuklasin natin...\\"").`
+PRE-LESSON FORMAT — structure every day's "preLesson" using EXACTLY these three parts, in this order,
+and nothing else (no classroom routine, no attendance, no separate objective-setting line — those are
+not part of this field). Each part is a bold heading line followed by 1 bullet line ("- ...") that
+names a concrete teacher action AND the expected learner response/behavior, so it reads as a short
+classroom script rather than a label:
+1. **Review:** (a specific question or quick task that surfaces what learners recall from the prior
+   session, with the expected learner answer)
+2. **Drill:** (a fast, specific skill warm-up tied to a prerequisite skill for today's lesson)
+3. **Motive Question:** (one specific, engaging question tied to today's topic that hooks learners'
+   interest and leads naturally into the lesson, with the kind of answer it should draw out)`
     : `
-PRE-LESSON FORMAT — as 1-2 bullet lines ("- ...") covering routine/attendance and a brief motivational
-hook that gets learners ready for today's lesson.`;
+PRE-LESSON FORMAT — structure every day's "preLesson" using EXACTLY these three bullet lines ("- ..."),
+in this order, and nothing else: one for **Review** (of the previous lesson), one for **Drill**, and
+one for **Motive Question** (a hook question tied to today's topic). Do not add classroom routine,
+attendance, or any other item.`;
 
   const flowFormatBlock = isDetailed
     ? `
@@ -346,12 +343,13 @@ followed by one concrete, actionable bullet line:
 - "**If learners are ready to extend:**" — a specific, actionable task that stretches learners who
   mastered today's objective quickly.
 
-NOTE ON HEADING LABELS: every bold heading label written above in English (e.g. "Multiple Choice Test",
-"Exit Ticket", "Evidence of Success", "If learners need more support", "If learners are ready to
-extend") describes WHAT to include structurally — it is not a literal string you must copy. Per the
-LANGUAGE REQUIREMENT given earlier in this prompt, translate each of these heading labels into Filipino
-too when the lesson is in Filipino (e.g. "Pagsusulit na Maramihang Pagpipilian", "Katibayan ng
-Tagumpay"), so no field ends up with an English heading sitting inside otherwise-Filipino content.
+NOTE ON HEADING LABELS: every bold heading label written above in English (e.g. "Review", "Drill",
+"Motive Question", "Multiple Choice Test", "Exit Ticket", "Evidence of Success", "If learners need
+more support", "If learners are ready to extend") describes WHAT to include structurally — it is not a
+literal string you must copy. Per the LANGUAGE REQUIREMENT given earlier in this prompt, translate each
+of these heading labels into Filipino too when OUTPUT LANGUAGE is Filipino (e.g. "Balik-Aral",
+"Pagsusulit na Maramihang Pagpipilian", "Katibayan ng Tagumpay"), so no field ends up with an English
+heading sitting inside otherwise-Filipino content.
 `.trim();
 
   const prompt = `You are an expert Philippine DepEd basic education teacher writing a Daily Lesson Log (DLL) in the ILAW Format for the MATATAG curriculum. Your output will be evaluated against the official ILAW quality rubric, so it must satisfy all of the following:
@@ -384,18 +382,26 @@ CONTEXT AND LEVEL REQUIREMENTS (very important):
   materials, items learners can bring from home, or simple teacher demonstrations).
 
 LANGUAGE REQUIREMENT (very important):
-- First, detect the language of the "Topic/Competency focus" input above: "${topic}".
-- If that input is written primarily in Filipino/Tagalog (or a Filipino-dominant mix), write EVERY
-  text field in the JSON output — competency, objectives, learnerContext, preLesson, flow, resources,
-  integration, assessment, extended — entirely in natural, grade-appropriate Filipino. You may keep in
-  English only what is conventionally left untranslated in real Filipino classrooms: unavoidable
+- First, detect the language of the "Topic/Competency focus" input above: "${topic}". Classify it into
+  exactly one of these three cases:
+  (a) Purely English (no Filipino/Tagalog words) → OUTPUT LANGUAGE = English.
+  (b) Purely Filipino/Tagalog → OUTPUT LANGUAGE = Filipino.
+  (c) A mix of English and Filipino/Tagalog (Taglish/code-switched) → OUTPUT LANGUAGE = Filipino.
+  In other words: default to Filipino whenever any Filipino/Tagalog appears in the input; only use
+  English when the input is entirely English.
+- Once decided, that single OUTPUT LANGUAGE applies to the ENTIRE JSON output with no exceptions —
+  including the "competency" field itself, not just the per-day fields (objectives, learnerContext,
+  preLesson, flow, resources, integration, assessment, extended). Never let "competency" end up in a
+  different language than the rest of the document.
+- If OUTPUT LANGUAGE is Filipino: write everything in natural, grade-appropriate Filipino. You may keep
+  in English only what is conventionally left untranslated in real Filipino classrooms: unavoidable
   technical/scientific terms, proper nouns, and the lesson design pattern's phase names themselves
-  (e.g. "Engage", "Explore"). Everything else you write — instructions, questions, bullet content,
-  any bold sub-headings you compose — must be in Filipino, not English.
-- If that input is written primarily in English, continue writing everything in English exactly as
-  instructed above.
-- Do not mix languages within a field beyond the narrow exceptions above — commit to one language for
-  the bulk of each day's content, based on the detected language of the topic.
+  (e.g. "Engage", "Explore"). Everything else you write — instructions, questions, bullet content, any
+  bold sub-headings you compose — must be in Filipino, not English.
+- If OUTPUT LANGUAGE is English: write everything in English as instructed above, with no Filipino
+  words mixed in beyond common Philippine proper nouns/place names.
+- Do not mix languages within a field beyond the narrow exceptions above — commit to the one decided
+  OUTPUT LANGUAGE for the bulk of every field, in every day, throughout the whole document.
 
 ${schemaHint}`;
 
