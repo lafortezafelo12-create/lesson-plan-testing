@@ -228,7 +228,11 @@ otherAssessmentCheck.addEventListener("change", () => {
 });
 
 // ---------- Lesson exemplar (PDF) ----------
-const EXEMPLAR_MAX_BYTES = 4 * 1024 * 1024; // 4MB, keeps the JSON payload well within typical function body limits
+const EXEMPLAR_MAX_BYTES = 2.5 * 1024 * 1024; // 2.5MB raw. Base64 adds ~33% overhead, so this
+// stays safely under Netlify's ~4.5MB effective limit for binary payloads (out of its 6MB hard cap
+// on buffered request bodies) — a 4MB raw file, previously allowed here, could push a request over
+// that limit and get rejected by the platform before it ever reached the function, surfacing to the
+// browser as a raw HTML error page instead of JSON.
 
 const exemplarDrop = document.getElementById("exemplar-drop");
 const exemplarInput = document.getElementById("exemplar-input");
@@ -454,6 +458,16 @@ async function callAdmin(action, extra = {}) {
   return data;
 }
 
+function describeKeyStatus(status) {
+  if (!status.hasOverride) {
+    return "Currently using the default key from Netlify's environment variable.";
+  }
+  const list = status.previews.join(", ");
+  return status.keyCount > 1
+    ? `Currently using ${status.keyCount} custom keys with automatic failover (${list}).`
+    : `Currently using a custom key (${list}).`;
+}
+
 adminLoginBtn.addEventListener("click", async () => {
   const pw = adminPasswordInput.value;
   if (!pw) return;
@@ -464,9 +478,7 @@ adminLoginBtn.addEventListener("click", async () => {
     const status = await callAdmin("status");
     adminLoginView.classList.add("hidden");
     adminSettingsView.classList.remove("hidden");
-    adminStatusHint.textContent = status.hasOverride
-      ? `Currently using a custom key (${status.preview}).`
-      : "Currently using the default key from Netlify's environment variable.";
+    adminStatusHint.textContent = describeKeyStatus(status);
     adminSettingsHint.textContent = "";
     adminApikeyInput.value = "";
   } catch (err) {
@@ -484,17 +496,20 @@ adminPasswordInput.addEventListener("keydown", (e) => {
 adminSaveBtn.addEventListener("click", async () => {
   const key = adminApikeyInput.value.trim();
   if (!key) {
-    adminSettingsHint.textContent = "Paste an API key first.";
+    adminSettingsHint.textContent = "Paste at least one API key first.";
     return;
   }
   adminSaveBtn.disabled = true;
   adminSettingsHint.textContent = "Saving\u2026";
   try {
-    await callAdmin("set", { apiKey: key });
-    adminSettingsHint.textContent = "Saved. New generations will use this key.";
+    const saveResult = await callAdmin("set", { apiKey: key });
+    adminSettingsHint.textContent =
+      saveResult.keyCount > 1
+        ? `Saved ${saveResult.keyCount} keys. New generations will fail over between them automatically.`
+        : "Saved. New generations will use this key.";
     adminApikeyInput.value = "";
     const status = await callAdmin("status");
-    adminStatusHint.textContent = `Currently using a custom key (${status.preview}).`;
+    adminStatusHint.textContent = describeKeyStatus(status);
   } catch (err) {
     adminSettingsHint.textContent = err.message;
   } finally {

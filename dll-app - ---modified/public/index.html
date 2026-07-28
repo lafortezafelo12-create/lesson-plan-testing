@@ -222,8 +222,9 @@
     <div id="admin-settings-view" class="hidden">
       <h3>Admin Settings</h3>
       <p class="hint" id="admin-status-hint">Checking current key status&hellip;</p>
-      <label>New Gemini API key
-        <input type="password" id="admin-apikey-input" placeholder="Paste a new API key to replace the current one" autocomplete="off" />
+      <label>New Gemini API key(s)
+        <input type="password" id="admin-apikey-input" placeholder="Paste one key, or several separated by commas, to replace the current one(s)" autocomplete="off" />
+        <span class="field-help">Multiple comma-separated keys enable automatic failover if one is rate-limited or out of quota.</span>
       </label>
       <button id="admin-save-btn" class="btn-primary" type="button">Save API Key</button>
       <button id="admin-clear-btn" class="btn-secondary" type="button">Revert to Default (Env Var) Key</button>
