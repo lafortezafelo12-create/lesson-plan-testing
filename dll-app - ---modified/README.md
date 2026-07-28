@@ -76,6 +76,14 @@ In the Netlify dashboard: **Site configuration > Environment variables > Add a v
 | `GEMINI_API_KEY` | your Gemini API key (used unless an admin override is set) |
 | `ADMIN_PASSWORD` | the password you chose in step 2 &mdash; protects the Admin panel |
 
+**Multiple keys / automatic failover:** `GEMINI_API_KEY` can hold more than one key, separated by
+commas (e.g. `GEMINI_API_KEY=key-one,key-two,key-three`). If a generation request gets an
+invalid-key, permission, or rate-limit/quota error (HTTP 400/401/403/429) from Gemini, the function
+automatically retries with the next key in the list before giving up — useful if you're juggling
+multiple free-tier keys or want a backup key ready if one gets rate-limited. Errors unrelated to the
+key itself (e.g. a malformed request) fail immediately without cycling through every key. The same
+comma-separated format works in the Admin panel's key field, described below.
+
 Redeploy after adding/changing environment variables so the functions pick them up.
 
 ## Aligned to the ILAW quality rubric
@@ -153,10 +161,11 @@ Google renames/retires Gemini models fairly often. If a model option starts fail
 ## Admin panel
 
 Click **⚙ Admin** in the top bar, enter your `ADMIN_PASSWORD`, and you can:
-- See whether the site is currently using the default key (from `GEMINI_API_KEY`) or a custom
-  override, with a masked preview of the last 4 characters
-- Paste a new Gemini API key to use going forward (saved to Netlify Blobs, not to a file)
-- Revert to the default env-var key at any time
+- See whether the site is currently using the default key(s) (from `GEMINI_API_KEY`) or a custom
+  override, with a masked preview of the last 4 characters of each key
+- Paste one or more Gemini API keys (comma-separated) to use going forward &mdash; saved to Netlify
+  Blobs, not to a file &mdash; enabling the same automatic failover described above
+- Revert to the default env-var key(s) at any time
 
 The password check happens inside `netlify/functions/admin.js`, server-side &mdash; it is never
 present in any file sent to the browser, so it stays safe even in a public GitHub repo.
