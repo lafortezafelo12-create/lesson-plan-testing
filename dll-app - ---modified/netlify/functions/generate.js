@@ -21,7 +21,7 @@ const { connectLambda, getStore } = require("@netlify/blobs");
 // that's the whole point of offering it as the "higher quality, slower"
 // option.
 const MODEL_MAP = {
-  flash: { id: "gemini-3.5-flash", thinkingLevel: "low" },
+  flash: { id: "gemini-3.5-flash", thinkingLevel: "low", fallback: "flash-lite" },
   pro: { id: "gemini-3.1-pro-preview" },
   "flash-lite": { id: "gemini-3.1-flash-lite" },
 };
@@ -244,34 +244,98 @@ async function resolveApiKeys(event) {
 // 500) will fail identically no matter which key is used, so there's no
 // point burning the rest of Netlify's 60-second budget cycling through keys
 // for those — fail fast instead.
+// Key-specific problems (invalid key, no permission, rate-limited/quota) —
+// move to the next key immediately, no point waiting on the same one.
 const KEY_ROTATION_STATUSES = new Set([400, 401, 403, 429]);
+
+// Transient, model-side problems (e.g. "model is currently experiencing high
+// demand") — a different key won't help since it's the same overloaded
+// model either way, but a short wait-and-retry often does, since these are
+// usually brief capacity spikes. Retried on the SAME key first (with
+// backoff) before moving on to the next key.
+const RETRYABLE_STATUSES = new Set([500, 502, 503, 504]);
+const RETRY_BACKOFF_MS = [1000, 2000]; // up to 2 extra attempts per key
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 async function callGeminiWithFailover(modelUrlBase, body, apiKeys) {
   let lastFailure = null;
+  let totalAttempts = 0;
   for (let i = 0; i < apiKeys.length; i++) {
-    let resp;
-    try {
-      resp = await fetch(`${modelUrlBase}?key=${apiKeys[i]}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      });
-    } catch (networkErr) {
-      lastFailure = { status: null, errText: String(networkErr), attempts: i + 1 };
-      continue; // network hiccup — still worth trying the next key
-    }
-    if (resp.ok) {
-      return { ok: true, resp, attempts: i + 1 };
-    }
-    const errText = await resp.text();
-    lastFailure = { status: resp.status, errText, attempts: i + 1 };
-    if (!KEY_ROTATION_STATUSES.has(resp.status)) {
+    const key = apiKeys[i];
+    for (let retry = 0; retry <= RETRY_BACKOFF_MS.length; retry++) {
+      totalAttempts++;
+      let resp;
+      try {
+        resp = await fetch(`${modelUrlBase}?key=${key}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+      } catch (networkErr) {
+        lastFailure = { status: null, errText: String(networkErr), attempts: totalAttempts };
+        break; // network hiccup — move on to the next key
+      }
+      if (resp.ok) {
+        return { ok: true, resp, attempts: totalAttempts };
+      }
+      const errText = await resp.text();
+      lastFailure = { status: resp.status, errText, attempts: totalAttempts };
+
+      if (RETRYABLE_STATUSES.has(resp.status) && retry < RETRY_BACKOFF_MS.length) {
+        await sleep(RETRY_BACKOFF_MS[retry]);
+        continue; // brief wait, then retry the same key
+      }
+      if (KEY_ROTATION_STATUSES.has(resp.status) || RETRYABLE_STATUSES.has(resp.status)) {
+        break; // move on to the next key, if any remain
+      }
+      // Anything else fails identically on every key — stop immediately
+      // instead of burning the rest of the time budget.
       return { ok: false, ...lastFailure };
     }
-    // else: this key looks like the problem (invalid/rate-limited) — loop
-    // continues and tries the next key, if any remain.
   }
   return { ok: false, ...lastFailure };
+}
+
+// Runs a full generation attempt (with key failover/retry already handled
+// by callGeminiWithFailover) against one specific model, and validates that
+// it returned parseable JSON. Used for both the primary model and, if that
+// fails outright, a configured fallback model — see MODEL_MAP's "fallback"
+// field and where this is called from the handler below.
+async function generateForModel(modelKey, prompt, apiKeys) {
+  const modelConfig = MODEL_MAP[modelKey];
+  const generationConfig = {
+    responseMimeType: "application/json",
+    // No "temperature" override: Gemini 3.x models are tuned for their
+    // default of 1.0, and Google's own docs warn that lowering it can cause
+    // looping or degraded performance on complex, highly-structured tasks
+    // like this one.
+  };
+  if (modelConfig.thinkingLevel) {
+    generationConfig.thinkingConfig = { thinkingLevel: modelConfig.thinkingLevel };
+  }
+
+  const modelUrlBase = `https://generativelanguage.googleapis.com/v1beta/models/${modelConfig.id}:generateContent`;
+  const result = await callGeminiWithFailover(
+    modelUrlBase,
+    { contents: [{ role: "user", parts: [{ text: prompt }] }], generationConfig },
+    apiKeys
+  );
+
+  if (!result.ok) {
+    return { ok: false, modelKey, modelId: modelConfig.id, kind: "api", ...result };
+  }
+
+  const data = await result.resp.json();
+  const text = data?.candidates?.[0]?.content?.parts?.map((p) => p.text || "").join("") || "";
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return { ok: false, modelKey, modelId: modelConfig.id, kind: "parse", raw: text, attempts: result.attempts };
+  }
+
+  return { ok: true, modelKey, modelId: modelConfig.id, parsed, attempts: result.attempts };
 }
 
 exports.handler = async (event) => {
@@ -311,7 +375,6 @@ exports.handler = async (event) => {
 
   const modelKey = MODEL_MAP[model] ? model : DEFAULT_MODEL_KEY;
   const modelConfig = MODEL_MAP[modelKey];
-  const MODEL = modelConfig.id;
   const days = Math.max(1, Math.min(10, parseInt(numDays, 10) || 1));
   const mcCount = Math.max(1, Math.min(20, parseInt(mcItemCount, 10) || 5));
 
@@ -513,56 +576,53 @@ OUTPUT LANGUAGE (decided already — do not re-derive or override this):
 ${schemaHint}`;
 
   try {
-    const generationConfig = {
-      responseMimeType: "application/json",
-      // No "temperature" override: Gemini 3.x models are tuned for their
-      // default of 1.0, and Google's own docs warn that lowering it can
-      // cause looping or degraded performance on complex, highly-structured
-      // tasks like this one.
-    };
-    if (modelConfig.thinkingLevel) {
-      generationConfig.thinkingConfig = { thinkingLevel: modelConfig.thinkingLevel };
+    let attempt = await generateForModel(modelKey, prompt, apiKeys);
+    let usedFallback = false;
+
+    if (!attempt.ok && modelConfig.fallback && MODEL_MAP[modelConfig.fallback]) {
+      usedFallback = true;
+      attempt = await generateForModel(modelConfig.fallback, prompt, apiKeys);
     }
 
-    const modelUrlBase = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent`;
-    const result = await callGeminiWithFailover(
-      modelUrlBase,
-      { contents: [{ role: "user", parts: [{ text: prompt }] }], generationConfig },
-      apiKeys
-    );
-
-    if (!result.ok) {
+    if (!attempt.ok) {
+      const fallbackNote = usedFallback ? ` — fallback model also failed` : "";
+      if (attempt.kind === "parse") {
+        return {
+          statusCode: 502,
+          body: JSON.stringify({
+            error: `Model did not return valid JSON${fallbackNote}`,
+            raw: attempt.raw,
+            model: attempt.modelId,
+          }),
+        };
+      }
       const keyNote =
-        apiKeys.length > 1
-          ? ` (tried ${result.attempts} of ${apiKeys.length} configured keys)`
-          : "";
+        apiKeys.length > 1 ? ` (tried ${attempt.attempts} of ${apiKeys.length} configured keys)` : "";
       return {
         statusCode: 502,
         body: JSON.stringify({
-          error: `Gemini API error${keyNote}`,
-          details: result.errText,
-          model: MODEL,
+          error: `Gemini API error${keyNote}${fallbackNote}`,
+          details: attempt.errText,
+          model: attempt.modelId,
         }),
       };
     }
 
-    const data = await result.resp.json();
-    const text = data?.candidates?.[0]?.content?.parts?.map((p) => p.text || "").join("") || "";
-
-    let parsed;
-    try {
-      parsed = JSON.parse(text);
-    } catch {
-      return {
-        statusCode: 502,
-        body: JSON.stringify({ error: "Model did not return valid JSON", raw: text }),
+    const responseBody = { ...attempt.parsed };
+    if (usedFallback) {
+      // Surfaced to the browser so the UI can let the teacher know a
+      // different model was used — see app.js. Harmless extra key for any
+      // other consumer of this JSON, which only reads the fields it knows.
+      responseBody._meta = {
+        modelUsed: attempt.modelId,
+        requestedModel: MODEL_MAP[modelKey].id,
       };
     }
 
     return {
       statusCode: 200,
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(parsed),
+      body: JSON.stringify(responseBody),
     };
   } catch (err) {
     return { statusCode: 500, body: JSON.stringify({ error: String(err) }) };
