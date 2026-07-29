@@ -11,21 +11,26 @@
 const { connectLambda, getStore } = require("@netlify/blobs");
 
 // Each entry maps the frontend's short model key to the real Gemini model ID,
-// plus an optional thinkingLevel override. Gemini 3.x models default to
+// plus an optional thinkingLevel override and an optional "fallback" model
+// key. If a model fails outright (after exhausting its own key retries),
+// the handler follows "fallback" to the next model, and so on — a real
+// chain, capped at a couple of hops to bound worst-case latency (see
+// MAX_FALLBACK_HOPS in the handler below). Gemini 3.x models default to
 // "high" thinking when unspecified (Flash-Lite is the one exception, which
 // defaults to "minimal") — "high" can add significant latency on complex,
 // heavily-structured prompts like a Detailed multi-day lesson, enough to
 // exceed Netlify's fixed 60-second function timeout. Flash is pinned to
-// "low" to keep it fast and reliable for its "recommended" everyday role;
-// Pro is deliberately left at its default (slower, deeper reasoning) since
-// that's the whole point of offering it as the "higher quality, slower"
-// option.
+// "low" to keep it fast when it is used; Pro is deliberately left at its
+// default (slower, deeper reasoning) since that's the whole point of
+// offering it as the "higher quality, slower" option. Flash-Lite is the
+// default, everyday model (fastest, most reliable); if it fails, the chain
+// falls back to Pro rather than leaving the request with nowhere to go.
 const MODEL_MAP = {
   flash: { id: "gemini-3.5-flash", thinkingLevel: "low", fallback: "flash-lite" },
   pro: { id: "gemini-3.1-pro-preview" },
-  "flash-lite": { id: "gemini-3.1-flash-lite" },
+  "flash-lite": { id: "gemini-3.1-flash-lite", fallback: "pro" },
 };
-const DEFAULT_MODEL_KEY = "flash";
+const DEFAULT_MODEL_KEY = "flash-lite";
 
 // Each lesson-design pattern is expressed as an ordered list of phases.
 // The model is told to structure the "flow" field using exactly these
@@ -602,15 +607,26 @@ ${schemaHint}`;
 
   try {
     let attempt = await generateForModel(modelKey, prompt, apiKeys);
-    let usedFallback = false;
+    const fallbackChain = [];
+    // Capped at 2 hops (so at most 3 models total get tried) — keeps
+    // worst-case latency bounded within Netlify's 60-second limit even if
+    // every model in the chain fails after its own key retries.
+    const MAX_FALLBACK_HOPS = 2;
 
-    if (!attempt.ok && modelConfig.fallback && MODEL_MAP[modelConfig.fallback]) {
-      usedFallback = true;
-      attempt = await generateForModel(modelConfig.fallback, prompt, apiKeys);
+    let cursorKey = modelKey;
+    while (!attempt.ok && fallbackChain.length < MAX_FALLBACK_HOPS) {
+      const nextKey = MODEL_MAP[cursorKey].fallback;
+      if (!nextKey || !MODEL_MAP[nextKey]) break;
+      fallbackChain.push(nextKey);
+      cursorKey = nextKey;
+      attempt = await generateForModel(nextKey, prompt, apiKeys);
     }
+    const usedFallback = fallbackChain.length > 0;
 
     if (!attempt.ok) {
-      const fallbackNote = usedFallback ? ` — fallback model also failed` : "";
+      const fallbackNote = usedFallback
+        ? ` — also failed on fallback model(s): ${fallbackChain.map((k) => MODEL_MAP[k].id).join(", ")}`
+        : "";
       if (attempt.kind === "parse") {
         const errorLabel = attempt.truncated
           ? `The response was too long and got cut off before it finished${fallbackNote}. Try fewer days, "Concise" instead of "Detailed", or a shorter topic description.`
