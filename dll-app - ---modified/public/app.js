@@ -359,6 +359,10 @@ form.addEventListener("submit", async (e) => {
     resultEl.classList.remove("hidden");
     showEditView();
 
+    if (data._meta && data._meta.modelUsed) {
+      formHint.textContent = `Note: your selected model was unavailable, so this was generated using ${data._meta.modelUsed} instead. Review carefully before use.`;
+    }
+
     saveToLibrary({
       id: `${Date.now()}`,
       meta: currentMeta,
