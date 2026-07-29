@@ -306,6 +306,12 @@ async function generateForModel(modelKey, prompt, apiKeys) {
   const modelConfig = MODEL_MAP[modelKey];
   const generationConfig = {
     responseMimeType: "application/json",
+    // Gemini 3.x models support up to 65,536 output tokens, but the API
+    // silently defaults to just 8,192 if this isn't set explicitly — easily
+    // exceeded by a Detailed, multi-day lesson plan, which then gets cut off
+    // mid-JSON and fails to parse. Set to the model's max to remove that
+    // ceiling entirely.
+    maxOutputTokens: 65536,
     // No "temperature" override: Gemini 3.x models are tuned for their
     // default of 1.0, and Google's own docs warn that lowering it can cause
     // looping or degraded performance on complex, highly-structured tasks
@@ -327,12 +333,31 @@ async function generateForModel(modelKey, prompt, apiKeys) {
   }
 
   const data = await result.resp.json();
-  const text = data?.candidates?.[0]?.content?.parts?.map((p) => p.text || "").join("") || "";
+  const candidate = data?.candidates?.[0];
+  const text = candidate?.content?.parts?.map((p) => p.text || "").join("") || "";
+
+  // Defensive parse: try the raw text first (expected, since
+  // responseMimeType is set to application/json), then fall back to
+  // stripping a stray ```json ... ``` fence in case a model wraps it anyway.
   let parsed;
   try {
     parsed = JSON.parse(text);
   } catch {
-    return { ok: false, modelKey, modelId: modelConfig.id, kind: "parse", raw: text, attempts: result.attempts };
+    const stripped = text.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/i, "");
+    try {
+      parsed = JSON.parse(stripped);
+    } catch {
+      const truncated = candidate?.finishReason === "MAX_TOKENS";
+      return {
+        ok: false,
+        modelKey,
+        modelId: modelConfig.id,
+        kind: "parse",
+        raw: text,
+        truncated,
+        attempts: result.attempts,
+      };
+    }
   }
 
   return { ok: true, modelKey, modelId: modelConfig.id, parsed, attempts: result.attempts };
@@ -587,10 +612,13 @@ ${schemaHint}`;
     if (!attempt.ok) {
       const fallbackNote = usedFallback ? ` — fallback model also failed` : "";
       if (attempt.kind === "parse") {
+        const errorLabel = attempt.truncated
+          ? `The response was too long and got cut off before it finished${fallbackNote}. Try fewer days, "Concise" instead of "Detailed", or a shorter topic description.`
+          : `Model did not return valid JSON${fallbackNote}`;
         return {
           statusCode: 502,
           body: JSON.stringify({
-            error: `Model did not return valid JSON${fallbackNote}`,
+            error: errorLabel,
             raw: attempt.raw,
             model: attempt.modelId,
           }),
