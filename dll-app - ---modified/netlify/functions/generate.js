@@ -267,8 +267,9 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // Max time we are willing to wait out a per-minute rate limit (429) on the
 // same key before giving up on it. Netlify's function limit is 60s total, so
-// this must stay small.
-const MAX_RATE_LIMIT_WAIT_MS = 15000;
+// this must stay small (a long wait can push the whole request past the
+// function timeout and return an HTML error page instead of JSON).
+const MAX_RATE_LIMIT_WAIT_MS = 5000;
 
 // Reads Gemini's suggested wait from a 429 body: either the structured
 // "retryDelay": "12s" field or the "Please retry in 12.3s" message text.
