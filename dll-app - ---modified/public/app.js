@@ -347,7 +347,19 @@ form.addEventListener("submit", async (e) => {
         exemplar: exemplarData,
       }),
     });
-    const data = await resp.json();
+    // Netlify returns an HTML error page (not JSON) if the function times out
+    // or crashes, so read as text first and handle that case clearly.
+    const rawText = await resp.text();
+    let data;
+    try {
+      data = JSON.parse(rawText);
+    } catch {
+      throw new Error(
+        resp.status === 504 || resp.status === 502 || resp.status === 500
+          ? "The server took too long or crashed before responding (HTTP " + resp.status + "). Try again, or choose fewer days / \"Concise\" detail."
+          : "The server returned an unexpected response (HTTP " + resp.status + "). Please try again."
+      );
+    }
     if (!resp.ok) {
       const detail = data.details ? ` (${String(data.details).slice(0, 160)})` : "";
       throw new Error((data.error || "Generation failed") + detail);
@@ -534,4 +546,3 @@ adminClearBtn.addEventListener("click", async () => {
     adminClearBtn.disabled = false;
   }
 });
-
