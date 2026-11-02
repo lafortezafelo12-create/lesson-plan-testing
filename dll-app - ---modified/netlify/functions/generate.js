@@ -23,12 +23,14 @@ const { connectLambda, getStore } = require("@netlify/blobs");
 // "low" to keep it fast when it is used; Pro is deliberately left at its
 // default (slower, deeper reasoning) since that's the whole point of
 // offering it as the "higher quality, slower" option. Flash-Lite is the
-// default, everyday model (fastest, most reliable); if it fails, the chain
-// falls back to Pro rather than leaving the request with nowhere to go.
+// default, everyday model (fastest, most reliable). It has NO fallback:
+// Pro preview models typically have little or no quota on free/low tiers, so
+// falling back to one just produced a second, misleading 429 that hid the
+// real failure. Pro is only used when the teacher explicitly selects it.
 const MODEL_MAP = {
   flash: { id: "gemini-3.5-flash", thinkingLevel: "low", fallback: "flash-lite" },
   pro: { id: "gemini-3.1-pro-preview" },
-  "flash-lite": { id: "gemini-3.1-flash-lite", fallback: "pro" },
+  "flash-lite": { id: "gemini-3.1-flash-lite" },
 };
 const DEFAULT_MODEL_KEY = "flash-lite";
 
@@ -263,11 +265,37 @@ const RETRY_BACKOFF_MS = [1000, 2000]; // up to 2 extra attempts per key
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+// Max time we are willing to wait out a per-minute rate limit (429) on the
+// same key before giving up on it. Netlify's function limit is 60s total, so
+// this must stay small.
+const MAX_RATE_LIMIT_WAIT_MS = 15000;
+
+// Reads Gemini's suggested wait from a 429 body: either the structured
+// "retryDelay": "12s" field or the "Please retry in 12.3s" message text.
+// Returns milliseconds, or null if none is given (e.g. daily quota exhausted).
+function parseRetryDelayMs(errText) {
+  try {
+    const body = JSON.parse(errText);
+    const details = body?.error?.details || [];
+    for (const d of details) {
+      if (d && typeof d.retryDelay === "string") {
+        const m = d.retryDelay.match(/([\d.]+)s/);
+        if (m) return Math.ceil(parseFloat(m[1]) * 1000);
+      }
+    }
+  } catch {
+    // not JSON — fall through to the text match below
+  }
+  const m = String(errText).match(/retry in ([\d.]+)s/i);
+  return m ? Math.ceil(parseFloat(m[1]) * 1000) : null;
+}
+
 async function callGeminiWithFailover(modelUrlBase, body, apiKeys) {
   let lastFailure = null;
   let totalAttempts = 0;
   for (let i = 0; i < apiKeys.length; i++) {
     const key = apiKeys[i];
+    let rateLimitRetried = false;
     for (let retry = 0; retry <= RETRY_BACKOFF_MS.length; retry++) {
       totalAttempts++;
       let resp;
@@ -287,6 +315,17 @@ async function callGeminiWithFailover(modelUrlBase, body, apiKeys) {
       const errText = await resp.text();
       lastFailure = { status: resp.status, errText, attempts: totalAttempts };
 
+      // Per-minute rate limit: if Gemini says to retry shortly, wait once and
+      // retry the SAME key before rotating/failing. Long or unspecified
+      // delays (e.g. daily quota) skip this and move on immediately.
+      if (resp.status === 429 && !rateLimitRetried) {
+        const waitMs = parseRetryDelayMs(errText);
+        if (waitMs !== null && waitMs <= MAX_RATE_LIMIT_WAIT_MS) {
+          rateLimitRetried = true;
+          await sleep(waitMs + 250);
+          continue;
+        }
+      }
       if (RETRYABLE_STATUSES.has(resp.status) && retry < RETRY_BACKOFF_MS.length) {
         await sleep(RETRY_BACKOFF_MS[retry]);
         continue; // brief wait, then retry the same key
@@ -607,6 +646,17 @@ ${schemaHint}`;
 
   try {
     let attempt = await generateForModel(modelKey, prompt, apiKeys);
+    // Every failed attempt is recorded so the ORIGINAL failure (the one that
+    // actually matters) isn't overwritten by a later fallback's error.
+    const attemptLog = [];
+    const logFailure = (a) =>
+      attemptLog.push({
+        model: a.modelId,
+        status: a.status ?? null,
+        kind: a.kind,
+        details: a.errText ? String(a.errText).slice(0, 600) : undefined,
+      });
+    if (!attempt.ok) logFailure(attempt);
     const fallbackChain = [];
     // Capped at 2 hops (so at most 3 models total get tried) — keeps
     // worst-case latency bounded within Netlify's 60-second limit even if
@@ -620,6 +670,7 @@ ${schemaHint}`;
       fallbackChain.push(nextKey);
       cursorKey = nextKey;
       attempt = await generateForModel(nextKey, prompt, apiKeys);
+      if (!attempt.ok) logFailure(attempt);
     }
     const usedFallback = fallbackChain.length > 0;
 
@@ -642,12 +693,24 @@ ${schemaHint}`;
       }
       const keyNote =
         apiKeys.length > 1 ? ` (tried ${attempt.attempts} of ${apiKeys.length} configured keys)` : "";
+      // Report the FIRST failure (the originally requested model), not the
+      // last fallback's, since that's the real cause.
+      const first = attemptLog[0] || {};
+      let reason = "";
+      if (first.status === 429) {
+        reason = ` — rate limit or quota exceeded on ${first.model}. Wait a minute and try again; if it keeps happening, the daily quota may be used up (check Google AI Studio usage or enable billing)`;
+      } else if (first.status === 503 || first.status === 500) {
+        reason = ` — ${first.model} is temporarily overloaded. Please try again shortly`;
+      } else if (first.status) {
+        reason = ` — ${first.model} returned HTTP ${first.status}`;
+      }
       return {
         statusCode: 502,
         body: JSON.stringify({
-          error: `Gemini API error${keyNote}${fallbackNote}`,
-          details: attempt.errText,
-          model: attempt.modelId,
+          error: `Gemini API error${reason}${keyNote}${fallbackNote}`,
+          details: first.details,
+          model: first.model || attempt.modelId,
+          attempts: attemptLog,
         }),
       };
     }
