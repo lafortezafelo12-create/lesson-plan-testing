@@ -318,6 +318,13 @@ form.addEventListener("submit", async (e) => {
   const assessmentTypes = fd.getAll("assessmentTypes");
   const mcItemCount = Number(fd.get("mcItemCount")) || 5;
   const otherAssessment = fd.get("otherAssessment") ? fd.get("otherAssessment").trim() : "";
+  const contentStandard = (fd.get("contentStandard") || "").trim();
+  const performanceStandard = (fd.get("performanceStandard") || "").trim();
+  const suggestedActivities = (fd.get("suggestedActivities") || "").trim();
+  // One optional objective per day; blank entries are sent as "" so day order is kept.
+  const manualObjectives = Array.from({ length: numDays }, (_, i) =>
+    (fd.get("objective_" + (i + 1)) || "").trim()
+  );
 
   currentMeta = {
     lessonTitle: topic,
@@ -344,6 +351,7 @@ form.addEventListener("submit", async (e) => {
       body: JSON.stringify({
         subject, gradeLevel, topic, numDays, model,
         designPattern, activityDetail, assessmentTypes, mcItemCount, otherAssessment,
+        contentStandard, performanceStandard, suggestedActivities, manualObjectives,
         exemplar: exemplarData,
       }),
     });
@@ -546,3 +554,85 @@ adminClearBtn.addEventListener("click", async () => {
     adminClearBtn.disabled = false;
   }
 });
+
+
+
+// ---------- Hamburger menu / slide-out drawer ----------
+const menuToggle = document.getElementById("menu-toggle");
+const sideMenu = document.getElementById("side-menu");
+const menuBackdrop = document.getElementById("menu-backdrop");
+const menuCloseBtn = document.getElementById("menu-close");
+const menuLibraryCount = document.getElementById("menu-library-count");
+
+function openMenu() {
+  try { menuLibraryCount.textContent = String(getLibrary().length); } catch { menuLibraryCount.textContent = "0"; }
+  menuBackdrop.hidden = false;
+  requestAnimationFrame(() => menuBackdrop.classList.add("is-open"));
+  sideMenu.classList.add("is-open");
+  sideMenu.setAttribute("aria-hidden", "false");
+  menuToggle.setAttribute("aria-expanded", "true");
+  document.body.classList.add("menu-open");
+  menuCloseBtn.focus();
+}
+
+function closeMenu({ restoreFocus = true } = {}) {
+  menuBackdrop.classList.remove("is-open");
+  sideMenu.classList.remove("is-open");
+  sideMenu.setAttribute("aria-hidden", "true");
+  menuToggle.setAttribute("aria-expanded", "false");
+  document.body.classList.remove("menu-open");
+  setTimeout(() => { if (!sideMenu.classList.contains("is-open")) menuBackdrop.hidden = true; }, 220);
+  if (restoreFocus) menuToggle.focus();
+}
+
+menuToggle.addEventListener("click", () => {
+  sideMenu.classList.contains("is-open") ? closeMenu() : openMenu();
+});
+menuCloseBtn.addEventListener("click", () => closeMenu());
+menuBackdrop.addEventListener("click", () => closeMenu());
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && sideMenu.classList.contains("is-open")) closeMenu();
+});
+
+// Scroll items jump to a section; the Admin item (id="admin-open-btn") keeps its
+// own click handler that opens the admin modal, and the drawer closes as well.
+sideMenu.querySelectorAll(".side-menu__item").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    const targetId = btn.dataset.target;
+    closeMenu({ restoreFocus: !targetId && btn.id !== "admin-open-btn" });
+    if (targetId) {
+      const el = document.getElementById(targetId);
+      if (el) setTimeout(() => el.scrollIntoView({ behavior: "smooth", block: "start" }), 120);
+    }
+  });
+});
+
+
+// ---------- Per-day objective inputs (count follows "Number of days") ----------
+const numDaysSelect = form.querySelector('select[name="numDays"]');
+const objectivesList = document.getElementById("objectives-list");
+
+function renderObjectiveInputs() {
+  const count = Number(numDaysSelect.value) || 1;
+  // Keep anything already typed when the number of days changes.
+  const previous = {};
+  objectivesList.querySelectorAll("input").forEach((inp) => { previous[inp.name] = inp.value; });
+  objectivesList.innerHTML = "";
+  for (let i = 1; i <= count; i++) {
+    const label = document.createElement("label");
+    label.append(`Day ${i} objective `);
+    const hint = document.createElement("span");
+    hint.className = "label-optional";
+    hint.textContent = "(optional)";
+    label.appendChild(hint);
+    const input = document.createElement("input");
+    input.type = "text";
+    input.name = "objective_" + i;
+    input.placeholder = "e.g. Identify the observable properties of solids";
+    input.value = previous[input.name] || "";
+    label.appendChild(input);
+    objectivesList.appendChild(label);
+  }
+}
+numDaysSelect.addEventListener("change", renderObjectiveInputs);
+renderObjectiveInputs();
